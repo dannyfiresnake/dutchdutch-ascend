@@ -105,6 +105,6 @@ impl AscendClient {
     /// }
     /// ```
     pub async fn subscribe_state(&self) -> Result<StateReceiver> {
-        self.speaker.subscribe_state().await
+        self.speaker.subscribe_network_state().await
     }
 }

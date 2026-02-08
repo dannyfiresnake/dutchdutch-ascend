@@ -51,20 +51,6 @@ pub struct ApiError {
     pub detail: String,
 }
 
-/// API endpoint names
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Endpoint {
-    Discovery,
-    Master,
-    Targets,
-    Gain,
-    Mute,
-    ToneControl,
-    Preset2,
-    ChannelMapping,
-}
-
 /// API methods
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

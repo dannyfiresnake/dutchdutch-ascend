@@ -1,10 +1,12 @@
 [package]
 name = "dutchdutch-ascend"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Dutch and Dutch"]
 description = "Rust library for controlling Dutch and Dutch Ascend networked speakers"
 license = "MIT"
+repository = "https://github.com/dannydulai/dutchdutch-ascend"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
@@ -15,6 +17,7 @@ serde_json = "1.0"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 thiserror = "2.0"
 tracing = "0.1"
+mdns-sd = "0.11"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"

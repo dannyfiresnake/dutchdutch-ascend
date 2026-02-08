@@ -165,52 +165,102 @@ pub struct ChannelGains {
     pub right: f64,
 }
 
-
-/// Discovered room information from cloud discovery
+/// Streaming API method definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveredRoom {
-    pub id: RoomId,
-    pub name: String,
-    pub master_ip: String,
-    pub master_port: u16,
-    pub members: Vec<DeviceId>,
+pub struct StreamingApiMethod {
+    /// Method arguments (parameter types/names)
+    #[serde(default)]
+    pub arguments: Vec<serde_json::Value>,
+
+    /// Return value types
+    #[serde(default)]
+    #[serde(rename = "returnValues")]
+    pub return_values: Vec<serde_json::Value>,
+
+    /// Whether this method can be called
+    #[serde(default)]
+    pub callable: bool,
 }
 
-impl DiscoveredRoom {
-    /// Connect to this discovered room and return the AscendClient
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use dutchdutch_ascend::Discovery;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let mut discovery = Discovery::new();
-    ///     discovery.start().await?;
-    ///
-    ///     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    ///
-    ///     if let Some(discovered_room) = discovery.rooms().first() {
-    ///         let client = discovered_room.connect().await?;
-    ///         let rooms = client.rooms().await?;
-    ///         if let Some(room) = rooms.first() {
-    ///             room.set_gain(-20.0).await?;
-    ///         }
-    ///     }
-    ///
-    ///     discovery.stop().await;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub async fn connect(&self) -> crate::error::Result<crate::client::AscendClient> {
-        crate::client::AscendClient::connect(&self.master_ip, self.master_port).await
+/// Streaming API definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamingApi {
+    /// Available methods (play, pause, next, previous, etc.)
+    #[serde(default)]
+    pub methods: BTreeMap<String, StreamingApiMethod>,
+}
+
+/// Streaming information for now playing content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "StreamingInfoRaw")]
+pub struct StreamingInfo {
+    /// Service name (e.g., "Roon", "AirPlay", "Spotify Connect")
+    pub service_name: String,
+
+    /// Display lines (contains track info like title, artist, album)
+    pub display: Vec<String>,
+
+    /// Whether currently playing
+    pub is_playing: bool,
+
+    /// Track length in seconds (converted from milliseconds)
+    pub track_length: f64,
+
+    /// Current track position in seconds (converted from nanoseconds)
+    pub track_position: f64,
+
+    /// Repeat mode
+    pub repeat: String,
+
+    /// Shuffle state
+    pub shuffle: bool,
+
+    /// Available API methods
+    pub api: Option<StreamingApi>,
+}
+
+/// Raw streaming info from API (before conversion)
+#[derive(Debug, Clone, Deserialize)]
+struct StreamingInfoRaw {
+    #[serde(default)]
+    #[serde(rename = "serviceName")]
+    service_name: String,
+
+    #[serde(default)]
+    display: Vec<String>,
+
+    #[serde(default)]
+    is_playing: bool,
+
+    #[serde(default)]
+    track_length: f64,
+
+    #[serde(default)]
+    track_position: f64,
+
+    #[serde(default)]
+    repeat: String,
+
+    #[serde(default)]
+    shuffle: bool,
+
+    #[serde(default)]
+    api: Option<StreamingApi>,
+}
+
+impl From<StreamingInfoRaw> for StreamingInfo {
+    fn from(raw: StreamingInfoRaw) -> Self {
+        Self {
+            service_name: raw.service_name,
+            display: raw.display,
+            is_playing: raw.is_playing,
+            // Convert from milliseconds to seconds
+            track_length: raw.track_length / 1000.0,
+            // Convert from nanoseconds to seconds
+            track_position: raw.track_position / 1_000_000_000.0,
+            repeat: raw.repeat,
+            shuffle: raw.shuffle,
+            api: raw.api,
+        }
     }
-}
-
-/// Target information from the targets endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TargetsResponse {
-    pub rooms: BTreeMap<RoomId, serde_json::Value>,
-    pub devices: BTreeMap<DeviceId, Device>,
 }

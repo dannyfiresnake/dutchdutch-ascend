@@ -3,6 +3,11 @@ use crate::error::Result;
 use crate::protocol::{Method, Request};
 use crate::subscription::StateReceiver;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
+
+const MAX_CONNECT_RETRIES: u32 = 3;
+const RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Connection to a specific speaker
 pub struct SpeakerConnection {
@@ -13,15 +18,40 @@ pub struct SpeakerConnection {
 
 impl SpeakerConnection {
     /// Connect to a speaker at the given IP and port
+    ///
+    /// This will automatically retry the connection a few times if it fails.
     pub async fn connect(ip: String, port: u16) -> Result<Self> {
-        let url = format!("ws://{}:{}", ip, port);
-        let connection = Connection::connect(url).await?;
+        let url = if ip.contains(':') {
+            format!("ws://[{}]:{}", ip, port)
+        } else {
+            format!("ws://{}:{}", ip, port)
+        };
 
-        Ok(Self {
-            ip,
-            port,
-            connection: Arc::new(connection),
-        })
+        let mut last_error = None;
+
+        for attempt in 1..=MAX_CONNECT_RETRIES {
+            match Connection::connect(&url).await {
+                Ok(connection) => {
+                    tracing::info!("Connected to speaker at {} (attempt {})", ip, attempt);
+                    return Ok(Self {
+                        ip,
+                        port,
+                        connection: Arc::new(connection),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to connect to {} (attempt {}/{}): {}",
+                                 ip, attempt, MAX_CONNECT_RETRIES, e);
+                    last_error = Some(e);
+
+                    if attempt < MAX_CONNECT_RETRIES {
+                        sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
     }
 
     /// Get the speaker's IP address
@@ -50,7 +80,7 @@ impl SpeakerConnection {
     }
 
     /// Subscribe to state updates from the speaker
-    pub async fn subscribe_state(&self) -> Result<StateReceiver> {
+    pub async fn subscribe_network_state(&self) -> Result<StateReceiver> {
         let request = Request::new("network", Method::Subscribe);
         self.connection.send_only(request).await?;
 

@@ -3,7 +3,7 @@
 //! This library provides an async API for discovering and controlling Dutch and Dutch
 //! Ascend speaker systems. It supports:
 //!
-//! - Discovery via Ascend Cloud API
+//! - Discovery via mDNS (local network discovery)
 //! - Room control via local WebSocket connection
 //! - Volume and mute control (global and per-position)
 //! - Voicing profile selection and tone adjustment
@@ -25,27 +25,22 @@
 //!     // Wait for rooms to be discovered
 //!     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 //!
+//!     // Subscribe to discovery events
+//!     let mut events = discovery.subscribe();
+//!
 //!     // Get discovered rooms
 //!     let rooms = discovery.rooms();
-//!     if let Some(discovered_room) = rooms.first() {
-//!         println!("Found room: {}", discovered_room.name);
+//!     if let Some(room) = rooms.first() {
+//!         println!("Found room: {}", room.name());
 //!
-//!         // Connect to the discovered room
-//!         let client = discovered_room.connect().await?;
-//!         let room_objs = client.rooms().await?;
+//!         // Control the room directly
+//!         room.set_gain(-20.0).await?;
+//!         room.set_mute(false).await?;
+//!     }
 //!
-//!         if let Some(room) = room_objs.first() {
-//!             // Control the room
-//!             room.set_gain(-20.0).await?;
-//!             room.set_mute(false).await?;
-//!
-//!             // Subscribe to state updates
-//!             let mut updates = client.subscribe_state().await?;
-//!             while let Ok(update) = updates.recv().await {
-//!                 println!("State update: {:?}", update);
-//!                 break; // Just show one update
-//!             }
-//!         }
+//!     // Listen for room updates
+//!     if let Ok(event) = events.recv().await {
+//!         println!("Discovery event: {:?}", event);
 //!     }
 //!
 //!     discovery.stop().await;
@@ -75,8 +70,8 @@
 //!
 //! The library is organized into several layers:
 //!
-//! - **Discovery**: Cloud-based room discovery via `wss://api.ascend.audio/`
-//! - **Client**: Connection management and room access
+//! - **Discovery**: mDNS-based local network discovery of speakers
+//! - **Client**: Direct connection to speakers when IP is known
 //! - **Room**: High-level control API for speaker systems
 //! - **Connection**: Low-level WebSocket protocol handling
 //! - **Protocol**: JSON message structures
@@ -84,7 +79,7 @@
 
 mod client;
 mod connection;
-mod discovery;
+pub mod discovery;
 mod error;
 mod protocol;
 mod room;
@@ -94,12 +89,12 @@ mod types;
 
 // Public exports
 pub use client::AscendClient;
-pub use discovery::Discovery;
+pub use discovery::{Discovery, DiscoveryEvent};
 pub use error::{AscendError, Result};
 pub use room::{Room, RoomState};
 pub use subscription::{StateReceiver, StateUpdate};
 pub use types::{
-    ChannelGains, ChannelMapping, Device, DeviceId, DiscoveredRoom, GainData, GainLimits,
-    GainValue, MuteData, MuteState, PositionId, Preset, RoomId, ToneSettings,
-    VoicingProfile,
+    ChannelGains, ChannelMapping, Device, DeviceId, GainData, GainLimits,
+    GainValue, MuteData, MuteState, PositionId, Preset, RoomId, StreamingApi,
+    StreamingApiMethod, StreamingInfo, ToneSettings, VoicingProfile,
 };

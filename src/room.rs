@@ -1,7 +1,7 @@
 use crate::error::{AscendError, Result};
 use crate::protocol::{Method, Request, TargetType};
 use crate::speaker_connection::SpeakerConnection;
-use crate::types::{ChannelMapping, DeviceId, GainData, GainValue, MuteData, MuteState, Preset, RoomId, ToneSettings, VoicingProfile};
+use crate::types::{ChannelMapping, DeviceId, GainData, GainValue, MuteData, MuteState, Preset, RoomId, StreamingApi, StreamingInfo, ToneSettings, VoicingProfile};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,9 @@ pub struct RoomState {
 
     // Members is an object mapping device IDs to position IDs
     pub members: BTreeMap<DeviceId, String>,
+
+    // Member names (device names)
+    pub member_names: Vec<String>,
 
     // Gain data with global value and limits
     pub gain: GainData,
@@ -65,8 +68,8 @@ pub struct RoomState {
     // Channel mapping configuration
     pub channel_mapping: Option<ChannelMapping>,
 
-    // Streaming state
-    pub streaming: Option<bool>,
+    // Streaming info (now playing)
+    pub streaming_info: Option<StreamingInfo>,
 
     // Linear phase filter setting
     pub linear_phase: bool,
@@ -172,10 +175,32 @@ impl Room {
     }
 
     /// Update the room state from raw JSON (called internally by Discovery when state updates arrive)
-    pub(crate) fn update_from_json(&self, json: serde_json::Value) -> Result<()> {
+    /// Returns true if the state actually changed, false if it's the same
+    pub(crate) fn update_from_json(&self, json: serde_json::Value) -> Result<bool> {
         let new_state = parse_room_state_from_json(json)?;
-        *self.state.lock().unwrap() = new_state;
-        Ok(())
+        let mut state_lock = self.state.lock().unwrap();
+
+        // Check if anything meaningful changed (exclude raw_json from comparison)
+        let changed = state_lock.id != new_state.id
+            || state_lock.name != new_state.name
+            || state_lock.members != new_state.members
+            || state_lock.member_names != new_state.member_names
+            || !gains_equal(&state_lock.gain, &new_state.gain)
+            || !mutes_equal(&state_lock.mute, &new_state.mute)
+            || state_lock.sleep != new_state.sleep
+            || state_lock.selected_input != new_state.selected_input
+            || state_lock.selected_xlr != new_state.selected_xlr
+            || state_lock.input_modes_raw != new_state.input_modes_raw
+            || state_lock.selected_voicing_profile != new_state.selected_voicing_profile
+            || state_lock.last_selected_preset != new_state.last_selected_preset
+            || !streaming_info_equal(&state_lock.streaming_info, &new_state.streaming_info)
+            || state_lock.linear_phase != new_state.linear_phase;
+
+        if changed {
+            *state_lock = new_state;
+        }
+
+        Ok(changed)
     }
 
     /// Refresh the room state from the speaker
@@ -437,6 +462,85 @@ impl Room {
         self.speaker.connection().send_request(request).await?;
         Ok(())
     }
+
+    // ========== Streaming Control ==========
+
+    /// Call a streaming API method (play, pause, next, previous, etc.)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use dutchdutch_ascend::AscendClient;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = AscendClient::connect("192.168.1.100", 8768).await?;
+    /// let room = client.room().await?;
+    /// room.call_streaming_method("next", vec![]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn call_streaming_method(&self, method: impl Into<String>, arguments: Vec<serde_json::Value>) -> Result<()> {
+        let request = Request::new("streaming-api", Method::Update)
+            .with_target(TargetType::Room, self.state.lock().unwrap().id.to_string())
+            .with_data(json!({
+                "method": method.into(),
+                "arguments": arguments
+            }));
+
+        self.speaker.connection().send_request(request).await?;
+        Ok(())
+    }
+}
+
+/// Compare two GainData for equality
+fn gains_equal(a: &GainData, b: &GainData) -> bool {
+    (a.global - b.global).abs() < f64::EPSILON
+        && (a.limits.min - b.limits.min).abs() < f64::EPSILON
+        && (a.limits.max - b.limits.max).abs() < f64::EPSILON
+        && (a.limits.step - b.limits.step).abs() < f64::EPSILON
+}
+
+/// Compare two MuteData for equality
+fn mutes_equal(a: &MuteData, b: &MuteData) -> bool {
+    a.global == b.global && a.positions == b.positions
+}
+
+/// Compare two Option<StreamingInfo> for equality
+fn streaming_info_equal(a: &Option<StreamingInfo>, b: &Option<StreamingInfo>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.service_name == b.service_name
+                && a.display == b.display
+                && a.is_playing == b.is_playing
+                && (a.track_length - b.track_length).abs() < f64::EPSILON
+                && (a.track_position - b.track_position).abs() < f64::EPSILON
+                && a.repeat == b.repeat
+                && a.shuffle == b.shuffle
+                && streaming_api_equal(&a.api, &b.api)
+        }
+        _ => false,
+    }
+}
+
+/// Compare two Option<StreamingApi> for equality
+fn streaming_api_equal(a: &Option<StreamingApi>, b: &Option<StreamingApi>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            if a.methods.len() != b.methods.len() {
+                return false;
+            }
+            a.methods.iter().all(|(name, method_a)| {
+                b.methods.get(name).map_or(false, |method_b| {
+                    method_a.callable == method_b.callable
+                        && method_a.arguments == method_b.arguments
+                        && method_a.return_values == method_b.return_values
+                })
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Parse room state from JSON value
@@ -470,6 +574,15 @@ fn parse_room_state_from_json(json: serde_json::Value) -> Result<RoomState> {
 
     let members: BTreeMap<DeviceId, String> = json.get("members")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let member_names: Vec<String> = json.get("memberNames")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.values()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     let gain: GainData = json.get("gain")
@@ -528,8 +641,8 @@ fn parse_room_state_from_json(json: serde_json::Value) -> Result<RoomState> {
     let channel_mapping: Option<ChannelMapping> = json.get("channelMapping")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    let streaming: Option<bool> = json.get("streaming")
-        .and_then(|v| v.as_bool());
+    let streaming_info: Option<StreamingInfo> = json.get("streamingInfo")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     let linear_phase: bool = json.get("linearPhase")
         .and_then(|v| v.as_bool())
@@ -539,6 +652,7 @@ fn parse_room_state_from_json(json: serde_json::Value) -> Result<RoomState> {
         id,
         name,
         members,
+        member_names,
         gain,
         mute,
         sleep,
@@ -552,7 +666,7 @@ fn parse_room_state_from_json(json: serde_json::Value) -> Result<RoomState> {
         presets,
         last_selected_preset,
         channel_mapping,
-        streaming,
+        streaming_info,
         linear_phase,
         raw_json: json,
     })

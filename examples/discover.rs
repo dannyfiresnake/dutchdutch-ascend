@@ -4,7 +4,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dutchdutch_ascend::{
-    AscendClient, Discovery, Room,
+    discovery::DiscoveryEvent, AscendClient, Discovery, Room,
 };
 use tokio::sync::broadcast;
 use ratatui::{
@@ -30,7 +30,7 @@ struct App {
     connected_client: Option<AscendClient>,
     selected_room_id: Option<uuid::Uuid>,
     status_message: String,
-    update_receiver: Option<broadcast::Receiver<uuid::Uuid>>,
+    update_receiver: Option<broadcast::Receiver<DiscoveryEvent>>,
     json_cursor: usize,
     json_scroll: usize,
 }
@@ -38,7 +38,7 @@ struct App {
 impl App {
     fn new() -> Self {
         let discovery = Discovery::new();
-        let update_receiver = discovery.subscribe_updates();
+        let update_receiver = discovery.subscribe();
 
         Self {
             state: AppState::Discovery,
@@ -207,11 +207,25 @@ impl App {
     async fn handle_state_update(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(receiver) = &mut self.update_receiver {
             match receiver.try_recv() {
-                Ok(updated_room_id) => {
-                    // Check if this is the room we're currently viewing
-                    if self.selected_room_id == Some(updated_room_id) {
-                        // Room will automatically show updated state on next render
-                        self.status_message = "State updated from network".to_string();
+                Ok(event) => {
+                    match event {
+                        DiscoveryEvent::RoomAdded(room_id) => {
+                            self.status_message = format!("New room discovered: {}", room_id);
+                        }
+                        DiscoveryEvent::RoomUpdated(room_id) => {
+                            // Check if this is the room we're currently viewing
+                            if self.selected_room_id == Some(room_id) {
+                                // Room will automatically show updated state on next render
+                                self.status_message = "State updated from network".to_string();
+                            }
+                        }
+                        DiscoveryEvent::RoomRemoved(room_id) => {
+                            self.status_message = format!("Room removed: {}", room_id);
+                            // If we're viewing this room, go back to discovery
+                            if self.selected_room_id == Some(room_id) {
+                                self.go_back();
+                            }
+                        }
                     }
                 }
                 Err(broadcast::error::TryRecvError::Empty) => {
@@ -415,6 +429,89 @@ fn render_room_control(f: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
         ];
 
+        // Streaming info (now playing)
+        if let Some(streaming_info) = &state.streaming_info {
+            // Only show if there's actually content playing or display info
+            if streaming_info.is_playing || !streaming_info.display.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("Now Playing ({})", streaming_info.service_name),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                )));
+
+                // Display lines (title, artist, album, etc.)
+                for (i, line) in streaming_info.display.iter().enumerate() {
+                    if !line.is_empty() {
+                        let label = match i {
+                            0 => "  Title: ",
+                            1 => "  Artist: ",
+                            2 => "  Album: ",
+                            _ => "  ",
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(label, Style::default().fg(Color::Yellow)),
+                            Span::styled(
+                                line,
+                                if i == 0 {
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::Cyan)
+                                },
+                            ),
+                        ]));
+                    }
+                }
+
+                // Playback state
+                lines.push(Line::from(vec![
+                    Span::styled("  State: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        if streaming_info.is_playing { "Playing" } else { "Paused/Stopped" },
+                        if streaming_info.is_playing {
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        },
+                    ),
+                ]));
+
+                // Time position (both already converted to seconds)
+                if streaming_info.track_length > 0.0 {
+                    let pos_min = (streaming_info.track_position / 60.0).floor() as i32;
+                    let pos_sec = (streaming_info.track_position % 60.0).floor() as i32;
+                    let dur_min = (streaming_info.track_length / 60.0).floor() as i32;
+                    let dur_sec = (streaming_info.track_length % 60.0).floor() as i32;
+
+                    lines.push(Line::from(vec![
+                        Span::styled("  Time: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{}:{:02} / {}:{:02}", pos_min, pos_sec, dur_min, dur_sec),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                    ]));
+                }
+
+                // Shuffle and repeat
+                if streaming_info.shuffle || !streaming_info.repeat.is_empty() {
+                    let mut status = Vec::new();
+                    if streaming_info.shuffle {
+                        status.push("Shuffle");
+                    }
+                    if !streaming_info.repeat.is_empty() {
+                        status.push(&streaming_info.repeat);
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("  Mode: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            status.join(", "),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                    ]));
+                }
+
+                lines.push(Line::from(""));
+            }
+        }
+
         // Input modes
         if !state.input_modes.is_empty() {
             lines.push(Line::from(Span::styled("Inputs:", Style::default().fg(Color::Yellow))));
@@ -532,6 +629,17 @@ fn render_room_control(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("Devices: ", Style::default().fg(Color::Yellow)),
             Span::raw(format!("{}", state.members.len())),
         ]));
+
+        // Show member names if available
+        if !state.member_names.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    state.member_names.join(", "),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+        }
 
         let text = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
         f.render_widget(text, area);
