@@ -2,7 +2,7 @@
 name = "dutchdutch-ascend"
 version = "0.2.1"
 edition = "2021"
-description = "Unofficial Rust library for controlling Dutch & Dutch Ascend networked speakers"
+description = "Rust library for controlling Dutch & Dutch Ascend networked speakers"
 license = "MIT"
 repository = "https://github.com/dannyfiresnake/dutchdutch-ascend"
 readme = "README.md"
