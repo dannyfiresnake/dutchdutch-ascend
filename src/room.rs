@@ -321,6 +321,22 @@ impl Room {
 
     // ========== Input Selection ==========
 
+    /// Rename the room.
+    ///
+    /// This goes through the `room` endpoint rather than `name`: updating
+    /// `room` changes the name and nothing else, and `name` rejects update
+    /// outright with "Unknown method/endpoint combination".
+    pub async fn set_name(&self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+        let request = Request::new("room", Method::Update)
+            .with_target(TargetType::Room, self.state.lock().unwrap().id.to_string())
+            .with_data(json!({ "name": name.clone() }));
+
+        self.speaker.connection().send_request(request).await?;
+        self.state.lock().unwrap().name = name;
+        Ok(())
+    }
+
     /// Set the selected input source
     ///
     /// # Example
