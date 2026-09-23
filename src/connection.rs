@@ -147,7 +147,7 @@ impl Connection {
             let _ = tx.send(response);
         } else {
             // This is a subscription update (no matching request ID)
-            if let Some(update) = Self::parse_state_update(&response) {
+            for update in Self::parse_state_updates(&response) {
                 let _ = subscription_tx.send(update);
             }
         }
@@ -155,33 +155,41 @@ impl Connection {
         Ok(())
     }
 
-    /// Parse a response into a state update
-    fn parse_state_update(response: &Response) -> Option<StateUpdate> {
+    /// Parse a notification into one update per room it carries.
+    ///
+    /// A network notification describes every room, not just the one that
+    /// changed. Returning only the first match meant the rest were dropped --
+    /// and because serde_json orders object keys, it was always the same room
+    /// that won. Every other room's updates were discarded for the life of
+    /// the connection, so those rooms appeared frozen while the connection
+    /// looked perfectly healthy.
+    fn parse_state_updates(response: &Response) -> Vec<StateUpdate> {
         use crate::protocol::Method;
 
-        // Check if this is a network subscription notification
-        if response.meta.method == Method::Notify
-            && response.meta.response_type.as_deref() == Some("network") {
+        let mut updates = Vec::new();
 
-            if let Some(data) = &response.data {
-                // Look for data.state
-                if let Some(state) = data.get("state") {
-                    if let Some(state_obj) = state.as_object() {
-                        // Find the first room in the state
-                        for (_state_id, state_entry) in state_obj {
-                            if let Some(entry_data) = state_entry.get("data") {
-                                if entry_data.get("type").and_then(|v| v.as_str()) == Some("room") {
-                                    // Return raw JSON for room updates
-                                    return Some(StateUpdate::RoomUpdate(Box::new(entry_data.clone())));
-                                }
-                            }
-                        }
-                    }
+        if response.meta.method != Method::Notify
+            || response.meta.response_type.as_deref() != Some("network")
+        {
+            return updates;
+        }
+
+        let Some(state) = response.data.as_ref().and_then(|d| d.get("state")) else {
+            return updates;
+        };
+        let Some(state_obj) = state.as_object() else {
+            return updates;
+        };
+
+        for (_state_id, state_entry) in state_obj {
+            if let Some(entry_data) = state_entry.get("data") {
+                if entry_data.get("type").and_then(|v| v.as_str()) == Some("room") {
+                    updates.push(StateUpdate::RoomUpdate(Box::new(entry_data.clone())));
                 }
             }
         }
 
-        None
+        updates
     }
 
     /// Send a request and wait for the response
