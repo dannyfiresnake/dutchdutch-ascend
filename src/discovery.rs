@@ -1,6 +1,7 @@
 use crate::error::{AscendError, Result};
 use crate::room::Room;
 use crate::speaker_connection::SpeakerConnection;
+use crate::subscription::RecvOutcome;
 use crate::types::RoomId;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
@@ -295,13 +296,47 @@ async fn process_speaker(
         Ok(mut receiver) => {
             let rooms_clone = rooms.clone();
             let event_tx_clone = event_tx.clone();
+            let speakers_clone = speakers.clone();
             let speaker_clone = speaker.clone();
+            let ip = speaker_ip.to_string();
 
             tokio::spawn(async move {
-                while let Ok(update) = receiver.recv().await {
-                    process_state_update(update, &speaker_clone, &rooms_clone, &event_tx_clone).await;
+                loop {
+                    match receiver.recv_resilient().await {
+                        Ok(RecvOutcome::Update(update)) => {
+                            process_state_update(update, &speaker_clone, &rooms_clone, &event_tx_clone).await;
+                        }
+                        Ok(RecvOutcome::Lagged(missed)) => {
+                            // Falling behind is not the end of the stream, and
+                            // treating it as one used to strand this task: the
+                            // socket stayed up, requests kept working, and room
+                            // state silently stopped changing until a restart.
+                            // The speakers push a live input meter, so a burst
+                            // is routine. Re-read once to cover what was missed
+                            // and carry on listening.
+                            tracing::warn!("missed {} updates from {}, resyncing", missed, ip);
+                            match speaker_clone.request_network_state().await {
+                                Ok(data) => {
+                                    if let Err(e) = parse_and_update_rooms(
+                                        &data, &speaker_clone, &rooms_clone, &event_tx_clone) {
+                                        tracing::warn!("resync parse failed for {}: {}", ip, e);
+                                    }
+                                }
+                                Err(e) => tracing::warn!("resync failed for {}: {}", ip, e),
+                            }
+                        }
+                        Err(_) => {
+                            // The connection is gone. Drop it so a later mDNS
+                            // announcement rebuilds one instead of reusing a
+                            // dead handle. Rooms still hold the old connection,
+                            // so a full reconnect needs them rebound first --
+                            // see the note in README.
+                            tracing::info!("update stream for {} closed", ip);
+                            speakers_clone.lock().unwrap().remove(&ip);
+                            break;
+                        }
+                    }
                 }
-                tracing::debug!("State update receiver closed for speaker");
             });
         }
         Err(e) => {

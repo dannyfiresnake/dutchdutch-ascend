@@ -12,6 +12,16 @@ use uuid::Uuid;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The speakers answer RFC 6455 pings, so a connection that has gone quiet
+/// can be told apart from one that has died without polling application
+/// state for signs of life.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Silence longer than this means the socket is dead even though nothing
+/// reported an error -- a half-open TCP connection looks exactly like an
+/// idle one until you ask it something.
+const PONG_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// WebSocket connection state
 struct ConnectionState {
     /// Pending requests waiting for responses
@@ -38,7 +48,12 @@ impl Connection {
 
         // Create channels
         let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<Message>();
-        let (subscription_tx, _) = broadcast::channel(100);
+        // Deep enough that a burst of meter updates does not make every
+        // subscriber lag at once; lag is survivable now, but still lossy.
+        let (subscription_tx, _) = broadcast::channel(1024);
+
+        // Any traffic counts as proof of life, so this starts optimistic.
+        let last_seen = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
 
         let state = Arc::new(Mutex::new(ConnectionState {
             pending_requests: HashMap::new(),
@@ -58,8 +73,10 @@ impl Connection {
         // Spawn task to receive and process incoming messages
         let state_clone = state.clone();
         let subscription_tx_clone = subscription_tx.clone();
+        let last_seen_rx = last_seen.clone();
         tokio::spawn(async move {
             while let Some(msg_result) = read.next().await {
+                *last_seen_rx.lock().unwrap() = std::time::Instant::now();
                 match msg_result {
                     Ok(Message::Text(text)) => {
                         if let Err(e) = Self::handle_message(&state_clone, &subscription_tx_clone, text).await {
@@ -82,6 +99,28 @@ impl Connection {
             let mut state = state_clone.lock().await;
             state.pending_requests.clear();
             drop(write_handle);
+        });
+
+        // Keepalive. Without it a half-open connection sits there looking
+        // healthy: no error, no close frame, and no data ever again.
+        let state_ping = state.clone();
+        let last_seen_ping = last_seen;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PING_INTERVAL);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let quiet = last_seen_ping.lock().unwrap().elapsed();
+                let guard = state_ping.lock().await;
+                if quiet > PONG_TIMEOUT {
+                    tracing::warn!("no reply for {:?}, closing connection", quiet);
+                    let _ = guard.ws_tx.send(Message::Close(None));
+                    break;
+                }
+                if guard.ws_tx.send(Message::Ping(Vec::new())).is_err() {
+                    break;
+                }
+            }
         });
 
         Ok(Self {

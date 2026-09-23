@@ -17,6 +17,28 @@ A Rust library for controlling [Dutch and Dutch](https://dutchdutch.com/) networ
 - **Real-time Updates**: Subscribe to live state changes from the speakers
 - **Standby Control**: Put speakers in/out of standby mode
 
+## Connection health
+
+State arrives by subscription, not polling. Two things keep that trustworthy:
+
+- **Ping keepalive.** The speakers answer RFC 6455 pings, so a connection that
+  has merely gone quiet can be told apart from one that has died. A half-open
+  socket otherwise looks exactly like an idle one: no error, no close frame,
+  and no data ever again.
+- **Lag is survived, not fatal.** A subscriber that falls behind gets
+  `Lagged`, which means "you missed messages", not "the stream is gone".
+  `StateReceiver::recv_resilient` keeps the two apart; discovery re-reads
+  state once to cover the gap and carries on listening.
+
+Treating `Lagged` as fatal used to strand the update task permanently: the
+socket stayed up and requests kept working, while room state silently stopped
+changing until the process was restarted.
+
+**Not yet handled:** reconnecting after a connection really does die. The
+speaker is dropped from the map so a later mDNS announcement can rebuild it,
+but existing `Room` values still hold the old connection handle and would need
+rebinding first.
+
 ## Installation
 
 Add this to your `Cargo.toml`:

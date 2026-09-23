@@ -12,6 +12,17 @@ pub enum StateUpdate {
     DeviceUpdate(DeviceId, Device),
 }
 
+/// What a resilient receive produced.
+#[derive(Debug, Clone)]
+pub enum RecvOutcome {
+    /// A state update from the speakers.
+    Update(StateUpdate),
+    /// The receiver fell behind and this many messages were dropped. The
+    /// stream is still live: the right response is to resync and keep
+    /// listening, not to stop.
+    Lagged(u64),
+}
+
 /// Receiver for state updates
 pub struct StateReceiver {
     rx: broadcast::Receiver<StateUpdate>,
@@ -36,6 +47,20 @@ impl StateReceiver {
                     AscendError::ChannelError(format!("Lagged by {} messages", n))
                 }
             })
+    }
+
+    /// Receive, keeping "I missed messages" apart from "the stream is gone".
+    ///
+    /// `recv` collapses both into an error, which makes it easy to abandon a
+    /// perfectly live subscription after one burst -- the speakers push a live
+    /// input meter, so bursts are normal. Only a closed channel ends the
+    /// stream here.
+    pub async fn recv_resilient(&mut self) -> Result<RecvOutcome> {
+        match self.rx.recv().await {
+            Ok(update) => Ok(RecvOutcome::Update(update)),
+            Err(broadcast::error::RecvError::Lagged(n)) => Ok(RecvOutcome::Lagged(n)),
+            Err(broadcast::error::RecvError::Closed) => Err(AscendError::ConnectionClosed),
+        }
     }
 
     /// Try to receive a state update without blocking

@@ -92,7 +92,7 @@ pub use client::AscendClient;
 pub use discovery::{Discovery, DiscoveryEvent};
 pub use error::{AscendError, Result};
 pub use room::{Room, RoomState};
-pub use subscription::{StateReceiver, StateUpdate};
+pub use subscription::{RecvOutcome, StateReceiver, StateUpdate};
 pub use types::{
     ChannelGains, ChannelMapping, Device, DeviceId, GainData, GainLimits,
     GainValue, MuteData, MuteState, PositionId, Preset, RoomId, StreamingApi,
