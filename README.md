@@ -34,10 +34,15 @@ Treating `Lagged` as fatal used to strand the update task permanently: the
 socket stayed up and requests kept working, while room state silently stopped
 changing until the process was restarted.
 
-**Not yet handled:** reconnecting after a connection really does die. The
-speaker is dropped from the map so a later mDNS announcement can rebuild it,
-but existing `Room` values still hold the old connection handle and would need
-rebinding first.
+- **Reconnection is ordinary, not exceptional.** Each speaker gets a
+  supervisor that connects, reads state, subscribes, consumes until the stream
+  ends, and then goes round again with backoff (1s doubling to 30s). Recovery
+  is the same code path as the first connection.
+- **Rooms are dropped when their connection dies**, and `RoomRemoved` says so.
+  A `Room` holds the connection it was built from, so refreshing a stale one
+  would leave it sending to a dead socket. Dropping it means any other
+  connected speaker rebuilds it from its next notification -- every speaker
+  reports every room -- and failing that, its own supervisor reconnects.
 
 ## Installation
 

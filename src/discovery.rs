@@ -6,6 +6,7 @@ use crate::types::RoomId;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 const MDNS_SERVICE_TYPE: &str = "_x-clerk._tcp.local.";
@@ -55,6 +56,11 @@ pub struct Discovery {
     event_tx: Arc<broadcast::Sender<DiscoveryEvent>>,
     mdns_daemon: Option<ServiceDaemon>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// One supervisor per speaker, kept so `stop` can end them. Leaving them
+    /// detached would let a retrying supervisor outlive the Discovery that
+    /// spawned it, and `start` calls `stop` first -- so a restart would
+    /// quietly accumulate a second supervisor per speaker, then a third.
+    supervisors: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 impl Discovery {
@@ -67,6 +73,7 @@ impl Discovery {
             event_tx: Arc::new(event_tx),
             mdns_daemon: None,
             task_handle: None,
+            supervisors: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -113,6 +120,7 @@ impl Discovery {
         let speakers = self.speakers.clone();
         let rooms = self.rooms.clone();
         let event_tx = self.event_tx.clone();
+        let supervisors = self.supervisors.clone();
 
         // Spawn background task to process mDNS events
         let handle = tokio::spawn(async move {
@@ -138,7 +146,7 @@ impl Discovery {
                             }
 
                             // Process the newly discovered speaker
-                            if let Err(e) = process_speaker(&ip_str, &speakers, &rooms, &event_tx).await {
+                            if let Err(e) = process_speaker(&ip_str, &speakers, &rooms, &event_tx, &supervisors).await {
                                 tracing::warn!("Failed to process speaker at {}: {}", ip_str, e);
                             }
                         }
@@ -174,6 +182,16 @@ impl Discovery {
         // Wait for the background task to finish
         if let Some(handle) = self.task_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_millis(500), handle).await;
+        }
+
+        // End the per-speaker supervisors. They retry forever by design, so
+        // nothing else would ever stop them.
+        let handles: Vec<_> = {
+            let mut supervisors = self.supervisors.lock().unwrap();
+            std::mem::take(&mut *supervisors).into_values().collect()
+        };
+        for handle in handles {
+            handle.abort();
         }
     }
 
@@ -239,112 +257,146 @@ impl Default for Discovery {
     }
 }
 
-/// Process a single speaker: connect, get network state, subscribe, and add rooms
+/// How long to wait before the first reconnect attempt.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Ceiling for the reconnect backoff. A speaker unplugged overnight should
+/// not be retried thousands of times, and one rebooting should not be hit
+/// while it comes up.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Ensure a speaker has a supervisor looking after it.
+///
+/// This used to connect inline and spawn a task that, on disconnect, called
+/// back into this function. That is async recursion: proving the future is
+/// `Send` needs the answer before it can be computed. Inverting it -- spawn a
+/// supervisor that owns the whole connect-and-consume cycle in a plain loop --
+/// removes the recursion and makes reconnection a normal part of its life
+/// rather than an exceptional path bolted on the side.
 async fn process_speaker(
     speaker_ip: &str,
     speakers: &Arc<Mutex<BTreeMap<String, Arc<SpeakerConnection>>>>,
     rooms: &Arc<Mutex<BTreeMap<RoomId, Room>>>,
     event_tx: &Arc<broadcast::Sender<DiscoveryEvent>>,
+    supervisors: &Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
 ) -> Result<()> {
-    tracing::info!("Processing speaker at {}", speaker_ip);
-
-    // Check if we already have a connection to this speaker
-    let speaker = {
-        let speakers_lock = speakers.lock().unwrap();
-        if let Some(existing) = speakers_lock.get(speaker_ip) {
-            tracing::debug!("Reusing existing connection to {}", speaker_ip);
-            Some(existing.clone())
-        } else {
-            None
-        }
-    };
-
-    let speaker = if let Some(sp) = speaker {
-        sp
-    } else {
-        // Create new connection (outside of lock)
-        tracing::info!("Creating new connection to {}", speaker_ip);
-        let conn = SpeakerConnection::connect(speaker_ip.to_string(), SPEAKER_PORT).await?;
-        let arc_conn = Arc::new(conn);
-
-        // Insert into map
-        {
-            let mut speakers_lock = speakers.lock().unwrap();
-            speakers_lock.insert(speaker_ip.to_string(), arc_conn.clone());
-        }
-
-        arc_conn
-    };
-
-    // Request network state
-    let network_data = match speaker.request_network_state().await {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::warn!("Failed to get network state from {}: {}", speaker_ip, e);
-            return Err(e);
-        }
-    };
-
-    // Parse rooms from network state and update/add them
-    if let Err(e) = parse_and_update_rooms(&network_data, &speaker, rooms, event_tx) {
-        tracing::warn!("Failed to parse rooms from network data: {}", e);
-        return Err(e);
-    }
-
-    // Subscribe to state updates and spawn background task to process them
-    match speaker.subscribe_network_state().await {
-        Ok(mut receiver) => {
-            let rooms_clone = rooms.clone();
-            let event_tx_clone = event_tx.clone();
-            let speakers_clone = speakers.clone();
-            let speaker_clone = speaker.clone();
-            let ip = speaker_ip.to_string();
-
-            tokio::spawn(async move {
-                loop {
-                    match receiver.recv_resilient().await {
-                        Ok(RecvOutcome::Update(update)) => {
-                            process_state_update(update, &speaker_clone, &rooms_clone, &event_tx_clone).await;
-                        }
-                        Ok(RecvOutcome::Lagged(missed)) => {
-                            // Falling behind is not the end of the stream, and
-                            // treating it as one used to strand this task: the
-                            // socket stayed up, requests kept working, and room
-                            // state silently stopped changing until a restart.
-                            // The speakers push a live input meter, so a burst
-                            // is routine. Re-read once to cover what was missed
-                            // and carry on listening.
-                            tracing::warn!("missed {} updates from {}, resyncing", missed, ip);
-                            match speaker_clone.request_network_state().await {
-                                Ok(data) => {
-                                    if let Err(e) = parse_and_update_rooms(
-                                        &data, &speaker_clone, &rooms_clone, &event_tx_clone) {
-                                        tracing::warn!("resync parse failed for {}: {}", ip, e);
-                                    }
-                                }
-                                Err(e) => tracing::warn!("resync failed for {}: {}", ip, e),
-                            }
-                        }
-                        Err(_) => {
-                            // The connection is gone. Drop it so a later mDNS
-                            // announcement rebuilds one instead of reusing a
-                            // dead handle. Rooms still hold the old connection,
-                            // so a full reconnect needs them rebound first --
-                            // see the note in README.
-                            tracing::info!("update stream for {} closed", ip);
-                            speakers_clone.lock().unwrap().remove(&ip);
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-        Err(e) => {
-            tracing::warn!("Failed to subscribe to updates from {}: {}", speaker_ip, e);
+    {
+        let supervisors = supervisors.lock().unwrap();
+        if supervisors.contains_key(speaker_ip) {
+            tracing::debug!("{} is already supervised", speaker_ip);
+            return Ok(());
         }
     }
+
+    tracing::info!("Supervising speaker at {}", speaker_ip);
+    let handle = tokio::spawn(supervise_speaker(
+        speaker_ip.to_string(),
+        speakers.clone(),
+        rooms.clone(),
+        event_tx.clone(),
+    ));
+    supervisors
+        .lock()
+        .unwrap()
+        .insert(speaker_ip.to_string(), handle);
 
     Ok(())
+}
+
+/// Keep one speaker connected, subscribed, and its rooms current, for as long
+/// as this task lives.
+async fn supervise_speaker(
+    ip: String,
+    speakers: Arc<Mutex<BTreeMap<String, Arc<SpeakerConnection>>>>,
+    rooms: Arc<Mutex<BTreeMap<RoomId, Room>>>,
+    event_tx: Arc<broadcast::Sender<DiscoveryEvent>>,
+) {
+    let mut backoff = RECONNECT_BACKOFF;
+
+    loop {
+        let speaker = match SpeakerConnection::connect(ip.clone(), SPEAKER_PORT).await {
+            Ok(conn) => {
+                backoff = RECONNECT_BACKOFF;
+                Arc::new(conn)
+            }
+            Err(e) => {
+                tracing::debug!("Connecting to {} failed: {}", ip, e);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                continue;
+            }
+        };
+        speakers.lock().unwrap().insert(ip.clone(), speaker.clone());
+
+        match speaker.request_network_state().await {
+            Ok(data) => {
+                if let Err(e) = parse_and_update_rooms(&data, &speaker, &rooms, &event_tx) {
+                    tracing::warn!("Failed to parse rooms from {}: {}", ip, e);
+                }
+            }
+            Err(e) => tracing::warn!("Failed to get network state from {}: {}", ip, e),
+        }
+
+        match speaker.subscribe_network_state().await {
+            Ok(mut receiver) => loop {
+                match receiver.recv_resilient().await {
+                    Ok(RecvOutcome::Update(update)) => {
+                        process_state_update(update, &speaker, &rooms, &event_tx).await;
+                    }
+                    Ok(RecvOutcome::Lagged(missed)) => {
+                        // Falling behind is not the end of the stream. Re-read
+                        // once to cover what was missed, then carry on.
+                        tracing::warn!("Missed {} updates from {}, resyncing", missed, ip);
+                        match speaker.request_network_state().await {
+                            Ok(data) => {
+                                if let Err(e) =
+                                    parse_and_update_rooms(&data, &speaker, &rooms, &event_tx)
+                                {
+                                    tracing::warn!("Resync parse failed for {}: {}", ip, e);
+                                }
+                            }
+                            Err(e) => tracing::warn!("Resync failed for {}: {}", ip, e),
+                        }
+                    }
+                    Err(_) => break,
+                }
+            },
+            Err(e) => tracing::warn!("Failed to subscribe to {}: {}", ip, e),
+        }
+
+        tracing::info!("Connection to {} closed", ip);
+
+        // Unbind before retrying. A room keeps the connection it was built
+        // from, so one left behind would send to a dead socket forever. Drop
+        // them and any other speaker still connected will rebuild them from
+        // its next notification -- every speaker reports every room -- and
+        // failing that, this loop's own reconnect will.
+        speakers.lock().unwrap().remove(&ip);
+        drop_rooms_for(&rooms, &event_tx, &speaker);
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+/// Forget every room bound to a connection that has gone away.
+fn drop_rooms_for(
+    rooms: &Arc<Mutex<BTreeMap<RoomId, Room>>>,
+    event_tx: &Arc<broadcast::Sender<DiscoveryEvent>>,
+    speaker: &Arc<SpeakerConnection>,
+) {
+    let mut rooms_lock = rooms.lock().unwrap();
+    let orphaned: Vec<RoomId> = rooms_lock
+        .iter()
+        .filter(|(_, room)| room.is_bound_to(speaker))
+        .map(|(id, _)| *id)
+        .collect();
+
+    for id in orphaned {
+        tracing::info!("Room {} lost its connection", id);
+        rooms_lock.remove(&id);
+        let _ = event_tx.send(DiscoveryEvent::RoomRemoved(id));
+    }
 }
 
 /// Process a state update from a speaker

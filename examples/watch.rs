@@ -26,14 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while start.elapsed() < Duration::from_secs(secs) {
         match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            Ok(Ok(DiscoveryEvent::RoomUpdated(id))) | Ok(Ok(DiscoveryEvent::RoomAdded(id))) => {
-                let name = discovery
-                    .rooms()
-                    .into_iter()
-                    .find(|r| r.id() == id)
-                    .map(|r| r.name())
-                    .unwrap_or_else(|| id.to_string());
-                *counts.entry(name).or_default() += 1;
+            Ok(Ok(DiscoveryEvent::RoomRemoved(id))) => {
+                println!("  [{:>5.1}s] REMOVED {id}", start.elapsed().as_secs_f32());
+            }
+            Ok(Ok(DiscoveryEvent::RoomAdded(id))) => {
+                println!("  [{:>5.1}s] ADDED   {id}", start.elapsed().as_secs_f32());
+                *counts.entry(id.to_string()).or_default() += 1;
+            }
+            Ok(Ok(DiscoveryEvent::RoomUpdated(id))) => {
+                *counts.entry(id.to_string()).or_default() += 1;
             }
             _ => {}
         }

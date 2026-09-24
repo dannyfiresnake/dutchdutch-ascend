@@ -88,6 +88,15 @@ impl Room {
         })
     }
 
+    /// Is this room bound to the given connection?
+    ///
+    /// A room holds the connection it was built from, so when that connection
+    /// dies the room has to be dropped and rebuilt rather than merely
+    /// refreshed -- otherwise its commands keep going to a dead socket.
+    pub(crate) fn is_bound_to(&self, speaker: &Arc<SpeakerConnection>) -> bool {
+        Arc::ptr_eq(&self.speaker, speaker)
+    }
+
     /// Get the room ID
     pub fn id(&self) -> uuid::Uuid {
         self.state.lock().unwrap().id
