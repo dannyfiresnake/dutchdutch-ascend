@@ -258,7 +258,11 @@ impl Default for Discovery {
 }
 
 /// How long to wait before the first reconnect attempt.
-const RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+///
+/// Short enough to be invisible: the usual reason to be here is a socket that
+/// dropped while the speaker stayed put, and that reconnects on the first
+/// try. Doubling handles the case where it does not.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Ceiling for the reconnect backoff. A speaker unplugged overnight should
 /// not be retried thousands of times, and one rebooting should not be hit
@@ -315,10 +319,7 @@ async fn supervise_speaker(
 
     loop {
         let speaker = match SpeakerConnection::connect(ip.clone(), SPEAKER_PORT).await {
-            Ok(conn) => {
-                backoff = RECONNECT_BACKOFF;
-                Arc::new(conn)
-            }
+            Ok(conn) => Arc::new(conn),
             Err(e) => {
                 tracing::debug!("Connecting to {} failed: {}", ip, e);
                 tokio::time::sleep(backoff).await;
@@ -330,6 +331,11 @@ async fn supervise_speaker(
 
         match speaker.request_network_state().await {
             Ok(data) => {
+                // The connection has proved itself, so start the next
+                // backoff from scratch. Resetting on a bare connect would let
+                // a speaker that accepts and hangs up straight away keep the
+                // delay pinned at its minimum and be hammered.
+                backoff = RECONNECT_BACKOFF;
                 if let Err(e) = parse_and_update_rooms(&data, &speaker, &rooms, &event_tx) {
                     tracing::warn!("Failed to parse rooms from {}: {}", ip, e);
                 }

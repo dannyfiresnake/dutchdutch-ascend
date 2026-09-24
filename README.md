@@ -36,8 +36,9 @@ changing until the process was restarted.
 
 - **Reconnection is ordinary, not exceptional.** Each speaker gets a
   supervisor that connects, reads state, subscribes, consumes until the stream
-  ends, and then goes round again with backoff (1s doubling to 30s). Recovery
-  is the same code path as the first connection.
+  ends, and then goes round again with backoff (10ms doubling to 30s).
+  Recovery is the same code path as the first connection, and a socket that
+  dropped while the speaker stayed put comes back on the first try.
 - **Rooms are dropped when their connection dies**, and `RoomRemoved` says so.
   A `Room` holds the connection it was built from, so refreshing a stale one
   would leave it sending to a dead socket. Dropping it means any other
